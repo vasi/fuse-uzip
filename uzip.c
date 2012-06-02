@@ -22,11 +22,14 @@ typedef struct {
 	uint32_t blocks;
 } uzip_header;
 
+typedef int (*uzip_decomp)(char *in, int ilen, char *out, int olen);
+
 typedef struct {
 	int fd;
 	char *name;
 	uzip_header header;
 	uint64_t *offsets;
+	uzip_decomp decomp;
 } uzip;
 
 static uint64_t uzip_ntohll(uint64_t n) {
@@ -82,6 +85,14 @@ static int uzip_open(const char *path, struct fuse_file_info *fi) {
 	return 0;
 }
 
+int zlib_decomp(char *in, int ilen, char *out, int olen) {
+	uLongf dlen = olen;
+	int err = uncompress((Bytef*)out, &dlen, (Bytef*)in, ilen);
+	if (err != Z_OK)
+		return 0;
+	return (int)dlen;
+}
+
 static char *uzip_block(uzip *u, size_t n) {
 	if (n > u->header.blocks) {
 		fprintf(stderr, "Invalid block\n");
@@ -89,8 +100,9 @@ static char *uzip_block(uzip *u, size_t n) {
 	}
 	
 	size_t size = u->offsets[n+1] - u->offsets[n];
+	size_t osize = u->header.blocksize;
 	char *comp = NULL, *ucomp = NULL;
-	if (!(ucomp = calloc(1, u->header.blocksize))) {
+	if (!(ucomp = calloc(1, osize))) {
 		fprintf(stderr, "Can't allocate block memory\n");
 		goto error;
 	}
@@ -106,8 +118,8 @@ static char *uzip_block(uzip *u, size_t n) {
 		goto error;
 	}
 	
-	uLongf dlen = u->header.blocksize;
-	if (uncompress((Bytef*)ucomp, &dlen, (Bytef*)comp, size) != Z_OK) {
+	
+	if (u->decomp(comp, size, ucomp, osize) != osize) {
 		fprintf(stderr, "Decompression error\n");
 		goto error;
 	}
@@ -207,6 +219,7 @@ int main(int argc, char *argv[]) {
 		fprintf(stderr, "Bad uzip version\n");
 		return -1;
 	}
+	u.decomp = &zlib_decomp;
 	
 	if (lseek(u.fd, uzip_header_offset, SEEK_SET) == -1) {
 		perror("Seeking to header");
