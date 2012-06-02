@@ -12,9 +12,11 @@
 #include <unistd.h>
 
 #include <zlib.h>
+#include <lzma.h>
 
-static const char uzip_suf[] = ".uzip";
-static const char uzip_magic[] = "#!/bin/sh\n#V";
+static const char *uzip_sufs[] = { ".uzip", ".ulzma" };
+static const char uzip_magic[] = "#!/bin/sh\n#";
+static const size_t magic_len = sizeof(uzip_magic) - 1;
 static const size_t uzip_header_offset = 128;
 
 typedef struct {
@@ -85,12 +87,22 @@ static int uzip_open(const char *path, struct fuse_file_info *fi) {
 	return 0;
 }
 
-int zlib_decomp(char *in, int ilen, char *out, int olen) {
+static int zlib_decomp(char *in, int ilen, char *out, int olen) {
 	uLongf dlen = olen;
 	int err = uncompress((Bytef*)out, &dlen, (Bytef*)in, ilen);
 	if (err != Z_OK)
 		return 0;
 	return (int)dlen;
+}
+
+static int lzma_decomp(char *in, int ilen, char *out, int olen) {
+	uint64_t memlimit = UINT64_MAX;
+	size_t ipos = 0, opos = 0;
+	lzma_ret err = lzma_stream_buffer_decode(&memlimit, 0, NULL,
+		(uint8_t*)in, &ipos, ilen, (uint8_t*)out, &opos, olen);
+	if (err != LZMA_OK || ipos != ilen)
+		return 0;
+	return opos;
 }
 
 static char *uzip_block(uzip *u, size_t n) {
@@ -198,9 +210,13 @@ int main(int argc, char *argv[]) {
 	
 	uzip u;
 	u.name = strdup(basename(file));
-	size_t suf_pos = strlen(u.name) - strlen(uzip_suf);
-	if (strcmp(uzip_suf, u.name + suf_pos) == 0)
-		u.name[suf_pos] = '\0';
+	for (int i = 0; i < sizeof(uzip_sufs) / sizeof(uzip_sufs[0]); ++i) {
+		size_t suf_pos = strlen(u.name) - strlen(uzip_sufs[i]);
+		if (strcmp(uzip_sufs[i], u.name + suf_pos) == 0) {
+			u.name[suf_pos] = '\0';
+			break;
+		}
+	}
 	
 	u.fd = open(file, O_RDONLY);
 	free(file);
@@ -209,17 +225,32 @@ int main(int argc, char *argv[]) {
 		return -1;
 	}
 	
-	char magic[sizeof(uzip_magic)]; // including version char
-	if (read(u.fd, magic, sizeof(magic)) != sizeof(magic)
-			|| memcmp(magic, uzip_magic, sizeof(uzip_magic) - 1) != 0) {
+	char header[magic_len + 2];
+	if (read(u.fd, header, sizeof(header)) != sizeof(header)
+			|| memcmp(header, uzip_magic, magic_len) != 0) {
 		fprintf(stderr, "Not a uzip file\n");
 		return -1;
 	}
-	if (magic[sizeof(uzip_magic) - 1] != '2') {
+	
+	char type = header[magic_len];
+	int version = header[magic_len + 1];
+	int min_vers = 2;
+	switch (type) {
+		case 'V':
+			u.decomp = &zlib_decomp;
+			break;
+		case 'L':
+			min_vers = 3;
+			u.decomp = &lzma_decomp;
+			break;
+		default:
+			fprintf(stderr, "Bad uzip type\n");
+			return -1;
+	}
+	if (version > '9' || (version - '0') < min_vers) {
 		fprintf(stderr, "Bad uzip version\n");
 		return -1;
 	}
-	u.decomp = &zlib_decomp;
 	
 	if (lseek(u.fd, uzip_header_offset, SEEK_SET) == -1) {
 		perror("Seeking to header");
